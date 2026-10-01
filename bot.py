@@ -37,7 +37,7 @@ app = Client(
 
 URL_CACHE = {}
 
-def build_quality_buttons(post_id, formats):
+def build_quality_buttons(post_id, formats, direct_url=None):
     video_formats = []
     seen_heights = set()
     for f in formats:
@@ -48,32 +48,36 @@ def build_quality_buttons(post_id, formats):
                 seen_heights.add(height)
                 video_formats.append(f)
 
-    if not video_formats:
-        return None
-
-    video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
     buttons = []
-    row = []
-    for f in video_formats:
-        h = f.get("height")
-        btn_text = f"🎬 {h}p"
-        cb_data = f"dl|{post_id}|{f['format_id']}"
-        row.append(InlineKeyboardButton(btn_text, callback_data=cb_data))
-        if len(row) == 2:
+    if video_formats:
+        video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+        row = []
+        for f in video_formats:
+            h = f.get("height")
+            btn_text = f"🎬 {h}p"
+            cb_data = f"dl|{post_id}|{f['format_id']}"
+            row.append(InlineKeyboardButton(btn_text, callback_data=cb_data))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
             buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    
-    buttons.append([InlineKeyboardButton("✨ Best Quality", callback_data=f"dl|{post_id}|best")])
-    return InlineKeyboardMarkup(buttons)
+        
+        buttons.append([InlineKeyboardButton("✨ Best Quality", callback_data=f"dl|{post_id}|best")])
+
+    # Direct Download Link Button agar URL uplabdh ho
+    if direct_url:
+        buttons.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
+
+    return InlineKeyboardMarkup(buttons) if buttons else None
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     text = (
         "👋 **Namaste! Twitter/X Media Downloader Bot mein aapka swagat hai.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein, aur main poori details aur best quality ke saath download karke dunga!\n\n"
-        "⚡ Link send karke try karein."
+        "Mujhe kisi bhi Twitter/X post ka link bhejein. Main media ke saath captions, "
+        "multiple qualities aur badi files ke liye Direct Download Link provide karunga!\n\n"
+        "⚡ Send your link to start."
     )
     await message.reply_text(text)
 
@@ -85,7 +89,7 @@ async def handle_twitter_url(client: Client, message: Message):
         await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
-    status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
+    status_msg = await message.reply_text("🔍 **Post analyze ki ja rahi hai...**")
 
     loop = asyncio.get_running_loop()
     
@@ -97,20 +101,27 @@ async def handle_twitter_url(client: Client, message: Message):
     try:
         info = await loop.run_in_executor(None, extract)
         post_id = info.get("id", str(message.id))
+        
+        # Best direct stream URL nikalna
+        direct_url = info.get("url")
+        if not direct_url and info.get("formats"):
+            direct_url = info["formats"][-1].get("url")
+
         URL_CACHE[post_id] = {
             "url": url,
-            "info": info
+            "info": info,
+            "direct_url": direct_url
         }
 
-        markup = build_quality_buttons(post_id, info.get("formats", []))
+        markup = build_quality_buttons(post_id, info.get("formats", []), direct_url)
 
         if markup:
             await status_msg.edit_text(
-                "🎬 **Video mil gayi!**\n\nKripya apni pasand ki quality chunein:",
+                "🎬 **Media mil gaya!**\n\nTelegram par paane ke liye quality chunein ya **Direct Fast Download Link** se turant download karein:",
                 reply_markup=markup
             )
         else:
-            await status_msg.edit_text("⏳ **Download ho raha hai...**")
+            await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
             await process_download(client, message.chat.id, post_id, "best", status_msg)
 
     except Exception as e:
@@ -121,10 +132,10 @@ async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
     _, post_id = callback_query.data.split("|")
     cached = URL_CACHE.get(post_id)
     if not cached:
-        await callback_query.answer("⚠️ Link expire ho gaya, link dobara bhejein.", show_alert=True)
+        await callback_query.answer("⚠️ Link expire ho gaya, dubara post link bhejein.", show_alert=True)
         return
 
-    markup = build_quality_buttons(post_id, cached["info"].get("formats", []))
+    markup = build_quality_buttons(post_id, cached["info"].get("formats", []), cached.get("direct_url"))
     if markup:
         await callback_query.message.reply_text(
             "🎬 **Quality chunein:**",
@@ -140,11 +151,11 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
     cached = URL_CACHE.get(post_id)
     
     if not cached:
-        await callback_query.answer("⚠️ Link expire ho gaya. Kripya link dobara bhejein.", show_alert=True)
+        await callback_query.answer("⚠️️ Link expire ho gaya. Kripya dubara bhejein.", show_alert=True)
         return
 
-    await callback_query.answer("Downloading start...")
-    status_msg = await callback_query.message.edit_text("⏳ **Downloading media... kripya intezar karein.**")
+    await callback_query.answer("Processing...")
+    status_msg = await callback_query.message.edit_text("⏳ **Downloading... thoda intezar karein.**")
     
     await process_download(
         client, 
@@ -157,7 +168,7 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
 async def process_download(client, chat_id, post_id, format_id, status_msg):
     cached = URL_CACHE.get(post_id)
     url = cached["url"]
-    info_meta = cached.get("info", {})
+    direct_url = cached.get("direct_url")
     loop = asyncio.get_running_loop()
     
     out_dir = f"downloads/{post_id}"
@@ -184,17 +195,30 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             if files:
                 filename = files[0]
 
+        # File size check (Agar file 400 MB se badi ho toh direct link provide karein)
+        file_size_bytes = os.path.getsize(filename) if os.path.exists(filename) else 0
+        file_size_mb = file_size_bytes / (1024 * 1024)
+
+        if file_size_mb > 400:
+            os.remove(filename)
+            buttons = []
+            if direct_url:
+                buttons.append([InlineKeyboardButton("🚀 Direct Fast Download (Browser)", url=direct_url)])
+            await status_msg.edit_text(
+                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\n"
+                "Server memory limit ki wajah se 400MB+ files seedhe browser se download karna behtar hai. Neeche diye gaye link par click karke direct download karein:",
+                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+            )
+            return
+
         await status_msg.edit_text("⬆️ **Telegram par upload ho raha hai...**")
         
-        # Details Format karna (Tweet text, Uploader, Handles)
         description = dl_info.get("description") or dl_info.get("title") or ""
         uploader = dl_info.get("uploader") or dl_info.get("uploader_id") or ""
         uploader_id = dl_info.get("uploader_id", "")
         
-        # Caption tayar karna
         caption_parts = []
         if description:
-            # Agar text bohot lamba ho toh Telegram limit (1024 chars) ka dhyan rakhna
             caption_parts.append(description[:700])
         
         if uploader:
@@ -204,10 +228,13 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
         caption_parts.append("\n🤖 @MyTwitterXDownloader_bot")
         final_caption = "\n".join(caption_parts)
 
-        # Inline button jaisa dusre bot me hai
-        reply_markup = InlineKeyboardMarkup([
+        # Inline button jisme quality aur direct link dono ka option rahega
+        btn_rows = [
             [InlineKeyboardButton("Download with different quality 📥", callback_data=f"quality_menu|{post_id}")]
-        ])
+        ]
+        if direct_url:
+            btn_rows.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
+        reply_markup = InlineKeyboardMarkup(btn_rows)
 
         if filename.endswith(('.jpg', '.jpeg', '.png', '.webp')):
             await client.send_photo(chat_id=chat_id, photo=filename, caption=final_caption, reply_markup=reply_markup)
