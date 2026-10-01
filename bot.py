@@ -37,6 +37,23 @@ app = Client(
 
 URL_CACHE = {}
 
+def get_best_mp4_url(formats):
+    """Sirf direct downloadable MP4 url dhoondta hai (m3u8 ko ignore karke)"""
+    mp4_formats = []
+    for f in formats:
+        url = f.get("url", "")
+        proto = f.get("protocol", "")
+        # m3u8 playlist ko filter karein
+        if "m3u8" not in proto and ".m3u8" not in url:
+            if f.get("ext") == "mp4" or f.get("vcodec") != "none":
+                mp4_formats.append(f)
+    
+    if mp4_formats:
+        # Highest resolution MP4 pick karein
+        mp4_formats.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
+        return mp4_formats[0].get("url")
+    return None
+
 def build_quality_buttons(post_id, formats, direct_url=None):
     video_formats = []
     seen_heights = set()
@@ -44,7 +61,7 @@ def build_quality_buttons(post_id, formats, direct_url=None):
         height = f.get("height")
         proto = f.get("protocol", "")
         if height and height not in seen_heights:
-            if "m3u8" not in proto:
+            if "m3u8" not in proto and ".m3u8" not in f.get("url", ""):
                 seen_heights.add(height)
                 video_formats.append(f)
 
@@ -65,9 +82,9 @@ def build_quality_buttons(post_id, formats, direct_url=None):
         
         buttons.append([InlineKeyboardButton("✨ Best Quality", callback_data=f"dl|{post_id}|best")])
 
-    # Direct Download Link Button agar URL uplabdh ho
-    if direct_url:
-        buttons.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
+    # Direct Fast Download Link button (Sirf tabhi jab true MP4 URL ho)
+    if direct_url and ".m3u8" not in direct_url:
+        buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
@@ -76,7 +93,7 @@ async def start_command(client: Client, message: Message):
     text = (
         "👋 **Namaste! Twitter/X Media Downloader Bot mein aapka swagat hai.**\n\n"
         "Mujhe kisi bhi Twitter/X post ka link bhejein. Main media ke saath captions, "
-        "multiple qualities aur badi files ke liye Direct Download Link provide karunga!\n\n"
+        "multiple qualities aur Direct MP4 Download Link provide karunga!\n\n"
         "⚡ Send your link to start."
     )
     await message.reply_text(text)
@@ -102,10 +119,8 @@ async def handle_twitter_url(client: Client, message: Message):
         info = await loop.run_in_executor(None, extract)
         post_id = info.get("id", str(message.id))
         
-        # Best direct stream URL nikalna
-        direct_url = info.get("url")
-        if not direct_url and info.get("formats"):
-            direct_url = info["formats"][-1].get("url")
+        formats = info.get("formats", [])
+        direct_url = get_best_mp4_url(formats)
 
         URL_CACHE[post_id] = {
             "url": url,
@@ -113,11 +128,11 @@ async def handle_twitter_url(client: Client, message: Message):
             "direct_url": direct_url
         }
 
-        markup = build_quality_buttons(post_id, info.get("formats", []), direct_url)
+        markup = build_quality_buttons(post_id, formats, direct_url)
 
         if markup:
             await status_msg.edit_text(
-                "🎬 **Media mil gaya!**\n\nTelegram par paane ke liye quality chunein ya **Direct Fast Download Link** se turant download karein:",
+                "🎬 **Media mil gaya!**\n\nTelegram par paane ke liye quality chunein ya browser direct download link use karein:",
                 reply_markup=markup
             )
         else:
@@ -151,7 +166,7 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
     cached = URL_CACHE.get(post_id)
     
     if not cached:
-        await callback_query.answer("⚠️️ Link expire ho gaya. Kripya dubara bhejein.", show_alert=True)
+        await callback_query.answer("⚠ Link expire ho gaya. Kripya dubara bhejein.", show_alert=True)
         return
 
     await callback_query.answer("Processing...")
@@ -195,18 +210,17 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             if files:
                 filename = files[0]
 
-        # File size check (Agar file 400 MB se badi ho toh direct link provide karein)
         file_size_bytes = os.path.getsize(filename) if os.path.exists(filename) else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
 
         if file_size_mb > 400:
             os.remove(filename)
             buttons = []
-            if direct_url:
-                buttons.append([InlineKeyboardButton("🚀 Direct Fast Download (Browser)", url=direct_url)])
+            if direct_url and ".m3u8" not in direct_url:
+                buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
             await status_msg.edit_text(
-                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\n"
-                "Server memory limit ki wajah se 400MB+ files seedhe browser se download karna behtar hai. Neeche diye gaye link par click karke direct download karein:",
+                f"⚠ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\n"
+                "Server memory limit ki wajah se 400MB+ files seedhe browser se download karna behtar hai.",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
@@ -228,12 +242,12 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
         caption_parts.append("\n🤖 @MyTwitterXDownloader_bot")
         final_caption = "\n".join(caption_parts)
 
-        # Inline button jisme quality aur direct link dono ka option rahega
         btn_rows = [
             [InlineKeyboardButton("Download with different quality 📥", callback_data=f"quality_menu|{post_id}")]
         ]
-        if direct_url:
+        if direct_url and ".m3u8" not in direct_url:
             btn_rows.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
+            
         reply_markup = InlineKeyboardMarkup(btn_rows)
 
         if filename.endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -265,4 +279,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-    
+
