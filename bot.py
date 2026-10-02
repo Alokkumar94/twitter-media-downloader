@@ -40,6 +40,7 @@ app = Client(
 )
 
 URL_CACHE = {}
+ACTIVE_TASKS = {}  # {user_id: {"task": asyncio.Task, "status_msg": Message}}
 
 SECRET_COOKIE_PATH = "/etc/secrets/cookies.txt"
 WRITABLE_COOKIE_PATH = "/tmp/cookies.txt"
@@ -115,14 +116,12 @@ def build_quality_buttons(post_id, formats, direct_url=None):
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 def extract_tweet_details(url):
-    """Username aur Status ID nikalna"""
     match = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)", url)
     if match:
         return match.group(1), match.group(2)
     return None, None
 
 def fetch_photos_via_fxtwitter(username, tweet_id):
-    """FxTwitter direct API endpoint se 18+ photos fetch karna"""
     try:
         api_url = f"https://api.fxtwitter.com/{username}/status/{tweet_id}"
         req = urllib.request.Request(
@@ -134,7 +133,6 @@ def fetch_photos_via_fxtwitter(username, tweet_id):
         
         tweet = data.get("tweet", {})
         media_list = tweet.get("media", {}).get("photos", [])
-        
         photos = [p.get("url") for p in media_list if p.get("url")]
         text = tweet.get("text", "")
         author = tweet.get("author", {})
@@ -153,33 +151,72 @@ def fetch_photos_via_fxtwitter(username, tweet_id):
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein, video ya photo download ho jayegi!"
+        "Mujhe kisi bhi Twitter/X post ka link bhejein, video ya photo download ho jayegi!\n\n"
+        "Agar koi download beech me cancel karni ho, toh `/cancel` use karein."
     )
 
-@app.on_message(filters.text & ~filters.command(["start", "help"]))
+@app.on_message(filters.command("cancel"))
+async def cancel_task(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in ACTIVE_TASKS:
+        task_info = ACTIVE_TASKS[user_id]
+        task = task_info.get("task")
+        if task and not task.done():
+            task.cancel()
+        status_msg = task_info.get("status_msg")
+        if status_msg:
+            try:
+                await status_msg.edit_text("❌ **Task cancel kar diya gaya hai.**")
+            except Exception:
+                pass
+        del ACTIVE_TASKS[user_id]
+        await message.reply_text("✅ Aapka chal raha task cancel ho gaya hai. Ab aap naya link bhej sakte hain.")
+    else:
+        await message.reply_text("⚠️ Aapka koi active task nahi chal raha hai.")
+
+@app.on_message(filters.text & ~filters.command(["start", "help", "cancel"]))
 async def handle_twitter_url(client: Client, message: Message):
-    url = message.text.strip()
+    user_id = message.from_user.id
     
+    # Check if a task is already running for this user
+    if user_id in ACTIVE_TASKS:
+        await message.reply_text(
+            "⚠️ **One Task Is Already Processing.**\n"
+            "Wait for complete it. If you want to cancel this task then use - /cancel"
+        )
+        return
+
+    url = message.text.strip()
     if not ("twitter.com" in url or "x.com" in url):
         await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
-    username, tweet_id = extract_tweet_details(url)
+    task = asyncio.create_task(process_url(client, message, url, user_id))
+    ACTIVE_TASKS[user_id] = {"task": task, "status_msg": None}
+
+async def process_url(client: Client, message: Message, url: str, user_id: int):
     status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
+    if user_id in ACTIVE_TASKS:
+        ACTIVE_TASKS[user_id]["status_msg"] = status_msg
+
+    username, tweet_id = extract_tweet_details(url)
     loop = asyncio.get_running_loop()
 
-    # Pehle normal video check karein
-    def extract_video():
-        opts = get_ydl_options()
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-
     try:
-        info = await loop.run_in_executor(None, extract_video)
-        formats = info.get("formats", []) if info else []
-        post_id = str(info.get("id") or tweet_id or message.id)
-        direct_url = get_best_mp4_url(formats)
+        def extract_video():
+            opts = get_ydl_options()
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
 
+        info = None
+        try:
+            info = await loop.run_in_executor(None, extract_video)
+        except Exception:
+            pass
+
+        formats = info.get("formats", []) if info else []
+        post_id = str(info.get("id") or tweet_id or message.id) if info else str(tweet_id or message.id)
+        direct_url = get_best_mp4_url(formats) if formats else None
         has_video = any(f.get("vcodec") != "none" and f.get("vcodec") is not None for f in formats)
 
         if formats and has_video:
@@ -188,34 +225,40 @@ async def handle_twitter_url(client: Client, message: Message):
                 "info": info,
                 "direct_url": direct_url
             }
-
             markup = build_quality_buttons(post_id, formats, direct_url)
             if markup:
                 await status_msg.edit_text(
                     "🎬 **Video mil gayi!**\n\nQuality chunein ya browser download link use karein:",
                     reply_markup=markup
                 )
+                ACTIVE_TASKS.pop(user_id, None)
                 return
-    except Exception:
-        pass
 
-    # Video nahi hai -> FxTwitter API se Photo/Gallery fetch karein
-    if username and tweet_id:
-        img_res = await loop.run_in_executor(None, lambda: fetch_photos_via_fxtwitter(username, tweet_id))
-        if img_res and img_res["photos"]:
-            photos = img_res["photos"]
-            caption = f"{img_res['text'][:650]}\n\n𝕏 **{img_res['author_name']} (@{img_res['author_handle']})**\n🤖 @MyTwitterXDownloader_bot"
-            
-            if len(photos) == 1:
-                await client.send_photo(chat_id=message.chat.id, photo=photos[0], caption=caption)
-            else:
-                media_group = [InputMediaPhoto(media=p, caption=caption if i == 0 else "") for i, p in enumerate(photos[:10])]
-                await client.send_media_group(chat_id=message.chat.id, media=media_group)
+        # Agar video nahi hai -> Photos fetch karein
+        if username and tweet_id:
+            img_res = await loop.run_in_executor(None, lambda: fetch_photos_via_fxtwitter(username, tweet_id))
+            if img_res and img_res["photos"]:
+                photos = img_res["photos"]
+                caption = f"{img_res['text'][:650]}\n\n𝕏 **{img_res['author_name']} (@{img_res['author_handle']})**\n🤖 @MyTwitterXDownloader_bot"
                 
-            await status_msg.delete()
-            return
+                if len(photos) == 1:
+                    await client.send_photo(chat_id=message.chat.id, photo=photos[0], caption=caption)
+                else:
+                    media_group = [InputMediaPhoto(media=p, caption=caption if i == 0 else "") for i, p in enumerate(photos[:10])]
+                    await client.send_media_group(chat_id=message.chat.id, media=media_group)
+                    
+                await status_msg.delete()
+                ACTIVE_TASKS.pop(user_id, None)
+                return
 
-    await status_msg.edit_text("⚠️ **Notice:** Is tweet me koi video ya photo nahi mili (sirf text post ho sakti hai).")
+        await status_msg.edit_text("⚠️ **Notice:** Is tweet me koi video ya photo nahi mili (sirf text post ho sakti hai).")
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+    finally:
+        ACTIVE_TASKS.pop(user_id, None)
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
@@ -234,6 +277,12 @@ async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^dl\|"))
 async def callback_download(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id in ACTIVE_TASKS:
+        await callback_query.answer("⚠️️ Pehle chal raha download complete hone dein!", show_alert=True)
+        return
+
     _, post_id, format_id = callback_query.data.split("|")
     cached = URL_CACHE.get(post_id)
     
@@ -241,24 +290,21 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
         return
 
-    await callback_query.answer("Downloading...")
-    status_msg = await callback_query.message.edit_text("⏳ **Download ho raha hai...**")
+    await callback_query.answer("Downloading start ho raha hai...")
+    status_msg = await callback_query.message.reply_text("⏳ **Download shuru ho raha hai...**")
     
-    await process_download(
-        client, 
-        callback_query.message.chat.id, 
-        post_id, 
-        format_id, 
-        status_msg
+    task = asyncio.create_task(
+        process_download(client, callback_query.message.chat.id, post_id, format_id, status_msg, user_id)
     )
+    ACTIVE_TASKS[user_id] = {"task": task, "status_msg": status_msg}
 
-async def process_download(client, chat_id, post_id, format_id, status_msg):
+async def process_download(client, chat_id, post_id, format_id, status_msg, user_id):
     cached = URL_CACHE.get(post_id)
     url = cached["url"]
     direct_url = cached.get("direct_url")
     loop = asyncio.get_running_loop()
     
-    out_dir = f"downloads/{post_id}"
+    out_dir = f"downloads/{post_id}_{user_id}"
     os.makedirs(out_dir, exist_ok=True)
     
     ydl_opts = get_ydl_options({
@@ -273,6 +319,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             return filename, dl_info
 
     try:
+        await status_msg.edit_text("⏳ **Twitter se download ho raha hai...**")
         filename, dl_info = await loop.run_in_executor(None, run_dl)
         
         if not os.path.exists(filename):
@@ -328,14 +375,16 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 
         await status_msg.delete()
 
+    except asyncio.CancelledError:
+        await status_msg.edit_text("❌ Download cancel kar diya gaya.")
     except Exception as e:
         await status_msg.edit_text(f"❌ Download fail: {str(e)[:250]}")
-
     finally:
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir, ignore_errors=True)
+        ACTIVE_TASKS.pop(user_id, None)
 
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-            
+    
