@@ -11,7 +11,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running successfully!")
+        self.wfile.write(b"Bot is active!")
 
     def log_message(self, format, *args):
         return
@@ -37,19 +37,40 @@ app = Client(
 
 URL_CACHE = {}
 
+# Cookies path check
+COOKIE_FILE = None
+for p in ["/etc/secrets/cookies.txt", os.path.join(os.getcwd(), "cookies.txt"), "cookies.txt"]:
+    if os.path.exists(p):
+        COOKIE_FILE = p
+        break
+
+if COOKIE_FILE:
+    print(f"✅ Loaded cookies successfully from: {COOKIE_FILE}")
+else:
+    print("⚠️ Cookies file nahi mili! 18+ posts block ho sakti hain.")
+
+def get_ydl_options(extra_opts=None):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    }
+    if COOKIE_FILE:
+        opts['cookiefile'] = COOKIE_FILE
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
+
 def get_best_mp4_url(formats):
-    """Sirf direct downloadable MP4 url dhoondta hai (m3u8 ko ignore karke)"""
     mp4_formats = []
     for f in formats:
         url = f.get("url", "")
         proto = f.get("protocol", "")
-        # m3u8 playlist ko filter karein
         if "m3u8" not in proto and ".m3u8" not in url:
             if f.get("ext") == "mp4" or f.get("vcodec") != "none":
                 mp4_formats.append(f)
     
     if mp4_formats:
-        # Highest resolution MP4 pick karein
         mp4_formats.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
         return mp4_formats[0].get("url")
     return None
@@ -82,43 +103,41 @@ def build_quality_buttons(post_id, formats, direct_url=None):
         
         buttons.append([InlineKeyboardButton("✨ Best Quality", callback_data=f"dl|{post_id}|best")])
 
-    # Direct Fast Download Link button (Sirf tabhi jab true MP4 URL ho)
     if direct_url and ".m3u8" not in direct_url:
-        buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
+        buttons.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
-    text = (
-        "👋 **Namaste! Twitter/X Media Downloader Bot mein aapka swagat hai.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein. Main media ke saath captions, "
-        "multiple qualities aur Direct MP4 Download Link provide karunga!\n\n"
-        "⚡ Send your link to start."
+    await message.reply_text(
+        "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
+        "Mujhe kisi bhi Twitter/X post (Video ya Image) ka link bhejein!"
     )
-    await message.reply_text(text)
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
 async def handle_twitter_url(client: Client, message: Message):
     url = message.text.strip()
     
     if not ("twitter.com" in url or "x.com" in url):
-        await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
+        await message.reply_text("❌ Kripya valid Twitter/X link bhejein.")
         return
 
-    status_msg = await message.reply_text("🔍 **Post analyze ki ja rahi hai...**")
-
+    status_msg = await message.reply_text("🔍 **Post fetch ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
-    
+
     def extract():
-        ydl_opts = {'quiet': True, 'no_warnings': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        opts = get_ydl_options()
+        with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
         info = await loop.run_in_executor(None, extract)
-        post_id = info.get("id", str(message.id))
-        
+        if not info:
+            await status_msg.edit_text("❌ Media data nahi mila.")
+            return
+
+        post_id = str(info.get("id") or message.id)
         formats = info.get("formats", [])
         direct_url = get_best_mp4_url(formats)
 
@@ -132,33 +151,56 @@ async def handle_twitter_url(client: Client, message: Message):
 
         if markup:
             await status_msg.edit_text(
-                "🎬 **Media mil gaya!**\n\nTelegram par paane ke liye quality chunein ya browser direct download link use karein:",
+                "🎬 **Video mil gayi!**\n\nQuality chunein ya browser download link use karein:",
                 reply_markup=markup
             )
         else:
-            await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
-            await process_download(client, message.chat.id, post_id, "best", status_msg)
+            # Agar tweet me video nahi balki photo/image hai
+            thumbnails = info.get("thumbnails", [])
+            if thumbnails:
+                best_photo = thumbnails[-1].get("url")
+                caption = (info.get("description") or "")[:700] + "\n\n🤖 @MyTwitterXDownloader_bot"
+                await message.reply_photo(photo=best_photo, caption=caption)
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
+                await process_download(client, message.chat.id, post_id, "best", status_msg)
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        err = str(e)
+        if "No video could be found" in err:
+            # Fallback agar pure photo post ho
+            try:
+                flat_opts = get_ydl_options({'extract_flat': True})
+                with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+                    thumbs = info.get("thumbnails") or []
+                    if thumbs:
+                        best_img = thumbs[-1].get("url")
+                        caption = (info.get("description") or "")[:700] + "\n\n🤖 @MyTwitterXDownloader_bot"
+                        await message.reply_photo(photo=best_img, caption=caption)
+                        await status_msg.delete()
+                        return
+            except:
+                pass
+            await status_msg.edit_text("⚠️ **Notice:** Tweet load nahi hua. Post deleted ya private ho sakti hai.")
+        else:
+            await status_msg.edit_text(f"❌ Error: {err[:250]}")
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
     _, post_id = callback_query.data.split("|")
     cached = URL_CACHE.get(post_id)
     if not cached:
-        await callback_query.answer("⚠️ Link expire ho gaya, dubara post link bhejein.", show_alert=True)
+        await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
         return
 
     markup = build_quality_buttons(post_id, cached["info"].get("formats", []), cached.get("direct_url"))
     if markup:
-        await callback_query.message.reply_text(
-            "🎬 **Quality chunein:**",
-            reply_markup=markup
-        )
+        await callback_query.message.reply_text("🎬 **Quality chunein:**", reply_markup=markup)
         await callback_query.answer()
     else:
-        await callback_query.answer("Koi alag quality uplabdh nahi hai.", show_alert=True)
+        await callback_query.answer("Koi aur quality uplabdh nahi hai.", show_alert=True)
 
 @app.on_callback_query(filters.regex(r"^dl\|"))
 async def callback_download(client: Client, callback_query: CallbackQuery):
@@ -166,11 +208,11 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
     cached = URL_CACHE.get(post_id)
     
     if not cached:
-        await callback_query.answer("⚠ Link expire ho gaya. Kripya dubara bhejein.", show_alert=True)
+        await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
         return
 
-    await callback_query.answer("Processing...")
-    status_msg = await callback_query.message.edit_text("⏳ **Downloading... thoda intezar karein.**")
+    await callback_query.answer("Downloading...")
+    status_msg = await callback_query.message.edit_text("⏳ **Download kiya ja raha hai...**")
     
     await process_download(
         client, 
@@ -189,12 +231,10 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
     out_dir = f"downloads/{post_id}"
     os.makedirs(out_dir, exist_ok=True)
     
-    ydl_opts = {
+    ydl_opts = get_ydl_options({
         'format': f'{format_id}+bestaudio/best' if format_id != 'best' else 'best',
         'outtmpl': f'{out_dir}/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-    }
+    })
 
     def run_dl():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -219,8 +259,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             if direct_url and ".m3u8" not in direct_url:
                 buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
             await status_msg.edit_text(
-                f"⚠ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\n"
-                "Server memory limit ki wajah se 400MB+ files seedhe browser se download karna behtar hai.",
+                f"⚠️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
@@ -262,7 +301,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
         await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Download fail ho gaya: {str(e)}")
+        await status_msg.edit_text(f"❌ Download fail: {str(e)[:250]}")
 
     finally:
         if os.path.exists(out_dir):
@@ -279,4 +318,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-
+    
