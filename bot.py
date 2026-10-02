@@ -1,10 +1,13 @@
 import os
+import re
 import shutil
 import asyncio
 import threading
+import json
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 import yt_dlp
 
 # --- Render Dummy Web Server ---
@@ -12,7 +15,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"Bot is active!")
 
     def log_message(self, format, *args):
         return
@@ -111,11 +114,45 @@ def build_quality_buttons(post_id, formats, direct_url=None):
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
+def extract_tweet_id(url):
+    match = re.search(r"status/(\d+)", url)
+    return match.group(1) if match else None
+
+def fetch_tweet_images_via_cdn(tweet_id):
+    """Twitter ki public CDN syndication API se direct photos extract karna"""
+    try:
+        api_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://twitter.com/'
+        }
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            
+        photos = []
+        media_entities = data.get("mediaDetails", [])
+        for m in media_entities:
+            if m.get("type") == "photo":
+                photos.append(m.get("media_url_https"))
+                
+        user = data.get("user", {})
+        text = data.get("text", "")
+        return {
+            "photos": photos,
+            "text": text,
+            "user_name": user.get("name", ""),
+            "screen_name": user.get("screen_name", "")
+        }
+    except Exception as e:
+        print(f"CDN fetch error: {e}")
+        return None
+
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein, video ya photo download karke de dunga!"
+        "Mujhe kisi bhi Twitter/X post ka link bhejein, video ya photo download ho jayegi!"
     )
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
@@ -126,10 +163,11 @@ async def handle_twitter_url(client: Client, message: Message):
         await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
+    tweet_id = extract_tweet_id(url)
     status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
 
-    # Pehle normal video extract karne ki koshish karein
+    # Step 1: Pehle yt-dlp se video dhoondo
     def extract_video():
         opts = get_ydl_options()
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -138,7 +176,7 @@ async def handle_twitter_url(client: Client, message: Message):
     try:
         info = await loop.run_in_executor(None, extract_video)
         formats = info.get("formats", []) if info else []
-        post_id = str(info.get("id") or message.id)
+        post_id = str(info.get("id") or tweet_id or message.id)
         direct_url = get_best_mp4_url(formats)
 
         URL_CACHE[post_id] = {
@@ -155,61 +193,26 @@ async def handle_twitter_url(client: Client, message: Message):
                 reply_markup=markup
             )
             return
-    except Exception as e:
+    except Exception:
         pass
 
-    # Agar video fail ho ya na mile, toh authenticated cookies ke sath photo download karein
-    out_dir = f"downloads/{message.id}"
-    os.makedirs(out_dir, exist_ok=True)
-
-    def extract_photos():
-        opts = get_ydl_options({
-            'skip_download': True,
-            'writethumbnail': True,
-            'outtmpl': f'{out_dir}/image.%(ext)s',
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
-
-    try:
-        dl_info = await loop.run_in_executor(None, extract_photos)
-        
-        # Check karein agar koi downloaded photo file mili
-        downloaded_files = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
-        
-        caption_text = (dl_info.get("description") or dl_info.get("title") or "")[:700]
-        uploader = dl_info.get("uploader") or dl_info.get("uploader_id") or ""
-        caption = f"{caption_text}\n\n𝕏 **{uploader}**\n🤖 @MyTwitterXDownloader_bot"
-
-        if downloaded_files:
-            await client.send_photo(chat_id=message.chat.id, photo=downloaded_files[0], caption=caption)
-            await status_msg.delete()
-            return
+    # Step 2: Agar video nahi hai, toh Photo/Images extract karein
+    if tweet_id:
+        img_data = await loop.run_in_executor(None, lambda: fetch_tweet_images_via_cdn(tweet_id))
+        if img_data and img_data["photos"]:
+            photos = img_data["photos"]
+            caption = f"{img_data['text'][:650]}\n\n𝕏 **{img_data['user_name']} (@{img_data['screen_name']})**\n🤖 @MyTwitterXDownloader_bot"
             
-        # Agar local file nahi mili toh highest-res thumbnail URL bhej dein
-        thumbs = dl_info.get("thumbnails", [])
-        if thumbs:
-            best_thumb = thumbs[-1].get("url")
-            await client.send_photo(chat_id=message.chat.id, photo=best_thumb, caption=caption)
+            if len(photos) == 1:
+                await client.send_photo(chat_id=message.chat.id, photo=photos[0], caption=caption)
+            else:
+                media_group = [InputMediaPhoto(media=p, caption=caption if i == 0 else "") for i, p in enumerate(photos[:10])]
+                await client.send_media_group(chat_id=message.chat.id, media=media_group)
+                
             await status_msg.delete()
             return
 
-        await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka.")
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)[:250]}")
-
-    finally:
-        if os.path.exists(out_dir):
-            for f in os.listdir(out_dir):
-                try:
-                    os.remove(os.path.join(out_dir, f))
-                except:
-                    pass
-            try:
-                os.rmdir(out_dir)
-            except:
-                pass
+    await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka (Post sirf text ho sakti hai ya private hai).")
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
@@ -283,7 +286,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             if direct_url and ".m3u8" not in direct_url:
                 buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
             await status_msg.edit_text(
-                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
+                f"⚠️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
@@ -313,9 +316,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             
         reply_markup = InlineKeyboardMarkup(btn_rows)
 
-        if filename.endswith(('.jpg', '.jpeg', '.png', '.webp')):
-            await client.send_photo(chat_id=chat_id, photo=filename, caption=final_caption, reply_markup=reply_markup)
-        elif filename.endswith(('.mp4', '.mkv', '.webm', '.mov')):
+        if filename.endswith(('.mp4', '.mkv', '.webm', '.mov')):
             await client.send_video(chat_id=chat_id, video=filename, caption=final_caption, reply_markup=reply_markup, supports_streaming=True)
         elif filename.endswith('.gif'):
             await client.send_animation(chat_id=chat_id, animation=filename, caption=final_caption, reply_markup=reply_markup)
