@@ -1,9 +1,10 @@
 import os
 import re
-import glob
 import shutil
 import asyncio
 import threading
+import json
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
@@ -113,6 +114,41 @@ def build_quality_buttons(post_id, formats, direct_url=None):
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
+def extract_tweet_details(url):
+    """Username aur Status ID nikalna"""
+    match = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)", url)
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
+
+def fetch_photos_via_fxtwitter(username, tweet_id):
+    """FxTwitter direct API endpoint se 18+ photos fetch karna"""
+    try:
+        api_url = f"https://api.fxtwitter.com/{username}/status/{tweet_id}"
+        req = urllib.request.Request(
+            api_url,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+        
+        tweet = data.get("tweet", {})
+        media_list = tweet.get("media", {}).get("photos", [])
+        
+        photos = [p.get("url") for p in media_list if p.get("url")]
+        text = tweet.get("text", "")
+        author = tweet.get("author", {})
+        
+        return {
+            "photos": photos,
+            "text": text,
+            "author_name": author.get("name", username),
+            "author_handle": author.get("screen_name", username)
+        }
+    except Exception as e:
+        print(f"FxTwitter API error: {e}")
+        return None
+
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
@@ -128,10 +164,11 @@ async def handle_twitter_url(client: Client, message: Message):
         await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
+    username, tweet_id = extract_tweet_details(url)
     status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
 
-    # Pehle video check karein
+    # Pehle normal video check karein
     def extract_video():
         opts = get_ydl_options()
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -140,7 +177,7 @@ async def handle_twitter_url(client: Client, message: Message):
     try:
         info = await loop.run_in_executor(None, extract_video)
         formats = info.get("formats", []) if info else []
-        post_id = str(info.get("id") or message.id)
+        post_id = str(info.get("id") or tweet_id or message.id)
         direct_url = get_best_mp4_url(formats)
 
         has_video = any(f.get("vcodec") != "none" and f.get("vcodec") is not None for f in formats)
@@ -162,52 +199,23 @@ async def handle_twitter_url(client: Client, message: Message):
     except Exception:
         pass
 
-    # Video nahi hai -> yt-dlp ke through thumbnail/image extract karein (authenticated)
-    img_dir = f"downloads/img_{message.id}"
-    os.makedirs(img_dir, exist_ok=True)
-
-    def extract_image_via_ytdlp():
-        opts = get_ydl_options({
-            'skip_download': True,
-            'writethumbnail': True,
-            'outtmpl': f'{img_dir}/photo.%(ext)s',
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    try:
-        meta = await loop.run_in_executor(None, extract_image_via_ytdlp)
-        
-        # Metadata se high-res photos nikaalein
-        photos = []
-        if meta:
-            # 1. Check thumbnails list
-            for t in meta.get("thumbnails", []):
-                t_url = t.get("url", "")
-                if "media" in t_url or "twimg.com" in t_url:
-                    # Clean high-res format
-                    t_url = re.sub(r"&name=\w+", "&name=large", t_url)
-                    if t_url not in photos:
-                        photos.append(t_url)
-
-        description = (meta.get("description") or meta.get("title") or "")[:650]
-        uploader = meta.get("uploader") or meta.get("uploader_id") or ""
-        caption = f"{description}\n\n𝕏 **{uploader}**\n🤖 @MyTwitterXDownloader_bot"
-
-        if photos:
-            # Aakhri (best quality) photo bhejein
-            await client.send_photo(chat_id=message.chat.id, photo=photos[-1], caption=caption)
+    # Video nahi hai -> FxTwitter API se Photo/Gallery fetch karein
+    if username and tweet_id:
+        img_res = await loop.run_in_executor(None, lambda: fetch_photos_via_fxtwitter(username, tweet_id))
+        if img_res and img_res["photos"]:
+            photos = img_res["photos"]
+            caption = f"{img_res['text'][:650]}\n\n𝕏 **{img_res['author_name']} (@{img_res['author_handle']})**\n🤖 @MyTwitterXDownloader_bot"
+            
+            if len(photos) == 1:
+                await client.send_photo(chat_id=message.chat.id, photo=photos[0], caption=caption)
+            else:
+                media_group = [InputMediaPhoto(media=p, caption=caption if i == 0 else "") for i, p in enumerate(photos[:10])]
+                await client.send_media_group(chat_id=message.chat.id, media=media_group)
+                
             await status_msg.delete()
             return
 
-    except Exception as e:
-        print(f"Fallback extraction error: {e}")
-
-    finally:
-        if os.path.exists(img_dir):
-            shutil.rmtree(img_dir, ignore_errors=True)
-
-    await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka (Post sirf text ho sakti hai).")
+    await status_msg.edit_text("⚠️ **Notice:** Is tweet me koi video ya photo nahi mili (sirf text post ho sakti hai).")
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
@@ -330,3 +338,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
+            
