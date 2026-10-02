@@ -21,7 +21,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         return
 
 def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
