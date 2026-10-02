@@ -2,8 +2,6 @@ import os
 import shutil
 import asyncio
 import threading
-import json
-import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -113,40 +111,11 @@ def build_quality_buttons(post_id, formats, direct_url=None):
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
-async def download_twitter_images(client, chat_id, url, status_msg):
-    """Jab video na ho tab images fetch karne ke liye fallback"""
-    loop = asyncio.get_running_loop()
-    
-    def fetch_api():
-        # X / Twitter API URL converter for direct JSON metadata
-        api_url = url.replace("twitter.com", "api.vxtwitter.com").replace("x.com", "api.vxtwitter.com")
-        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode('utf-8'))
-
-    try:
-        data = await loop.run_in_executor(None, fetch_api)
-        media_urls = data.get("mediaURLs", [])
-        text = (data.get("text") or "")[:700]
-        user_name = data.get("user_name", "")
-        user_screen_name = data.get("user_screen_name", "")
-        
-        caption = f"{text}\n\n𝕏 **{user_name} (@{user_screen_name})**\n🤖 @MyTwitterXDownloader_bot"
-
-        if media_urls:
-            await client.send_photo(chat_id=chat_id, photo=media_urls[0], caption=caption)
-            await status_msg.delete()
-            return True
-    except Exception as e:
-        print(f"Image fallback error: {e}")
-    
-    return False
-
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein, chahe video ho ya photo!"
+        "Mujhe kisi bhi Twitter/X post ka link bhejein, video ya photo download karke de dunga!"
     )
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
@@ -160,18 +129,16 @@ async def handle_twitter_url(client: Client, message: Message):
     status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
 
-    def extract():
+    # Pehle normal video extract karne ki koshish karein
+    def extract_video():
         opts = get_ydl_options()
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
-        info = await loop.run_in_executor(None, extract)
-        if not info:
-            raise Exception("No video found")
-
+        info = await loop.run_in_executor(None, extract_video)
+        formats = info.get("formats", []) if info else []
         post_id = str(info.get("id") or message.id)
-        formats = info.get("formats", [])
         direct_url = get_best_mp4_url(formats)
 
         URL_CACHE[post_id] = {
@@ -187,15 +154,62 @@ async def handle_twitter_url(client: Client, message: Message):
                 "🎬 **Video mil gayi!**\n\nQuality chunein ya browser download link use karein:",
                 reply_markup=markup
             )
-        else:
-            await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
-            await process_download(client, message.chat.id, post_id, "best", status_msg)
+            return
+    except Exception as e:
+        pass
 
-    except Exception:
-        # Video nahi mili, ab direct photo check karein
-        success = await download_twitter_images(client, message.chat.id, url, status_msg)
-        if not success:
-            await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka.")
+    # Agar video fail ho ya na mile, toh authenticated cookies ke sath photo download karein
+    out_dir = f"downloads/{message.id}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    def extract_photos():
+        opts = get_ydl_options({
+            'skip_download': True,
+            'writethumbnail': True,
+            'outtmpl': f'{out_dir}/image.%(ext)s',
+        })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    try:
+        dl_info = await loop.run_in_executor(None, extract_photos)
+        
+        # Check karein agar koi downloaded photo file mili
+        downloaded_files = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+        
+        caption_text = (dl_info.get("description") or dl_info.get("title") or "")[:700]
+        uploader = dl_info.get("uploader") or dl_info.get("uploader_id") or ""
+        caption = f"{caption_text}\n\n𝕏 **{uploader}**\n🤖 @MyTwitterXDownloader_bot"
+
+        if downloaded_files:
+            await client.send_photo(chat_id=message.chat.id, photo=downloaded_files[0], caption=caption)
+            await status_msg.delete()
+            return
+            
+        # Agar local file nahi mili toh highest-res thumbnail URL bhej dein
+        thumbs = dl_info.get("thumbnails", [])
+        if thumbs:
+            best_thumb = thumbs[-1].get("url")
+            await client.send_photo(chat_id=message.chat.id, photo=best_thumb, caption=caption)
+            await status_msg.delete()
+            return
+
+        await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka.")
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {str(e)[:250]}")
+
+    finally:
+        if os.path.exists(out_dir):
+            for f in os.listdir(out_dir):
+                try:
+                    os.remove(os.path.join(out_dir, f))
+                except:
+                    pass
+            try:
+                os.rmdir(out_dir)
+            except:
+                pass
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
@@ -269,7 +283,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
             if direct_url and ".m3u8" not in direct_url:
                 buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
             await status_msg.edit_text(
-                f"⚠️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
+                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
