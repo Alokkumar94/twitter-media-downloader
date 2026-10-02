@@ -55,6 +55,26 @@ if os.path.exists(SECRET_COOKIE_PATH):
 elif os.path.exists("cookies.txt"):
     COOKIE_FILE = "cookies.txt"
 
+def get_auth_cookies():
+    """Cookies file se auth_token aur ct0 nikaalna"""
+    cookies = {}
+    path = COOKIE_FILE or SECRET_COOKIE_PATH
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 7:
+                        name = parts[5]
+                        val = parts[6]
+                        if name in ["auth_token", "ct0"]:
+                            cookies[name] = val
+        except Exception as e:
+            print(f"Error reading cookies: {e}")
+    return cookies
+
 def get_ydl_options(extra_opts=None):
     opts = {
         'quiet': True,
@@ -118,35 +138,60 @@ def extract_tweet_id(url):
     match = re.search(r"status/(\d+)", url)
     return match.group(1) if match else None
 
-def fetch_tweet_images_via_cdn(tweet_id):
-    """Twitter ki public CDN syndication API se direct photos extract karna"""
+def fetch_tweet_images_authenticated(tweet_id):
+    """Twitter GraphQL / Syndication with cookies fallback for 18+ photos"""
+    cookies = get_auth_cookies()
+    cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+    
+    # Koshish 1: Syndication with Cookies
     try:
         api_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': 'https://twitter.com/'
+            'Referer': 'https://twitter.com/',
         }
+        if cookie_str:
+            headers['Cookie'] = cookie_str
+            
         req = urllib.request.Request(api_url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
             
         photos = []
-        media_entities = data.get("mediaDetails", [])
-        for m in media_entities:
+        for m in data.get("mediaDetails", []):
             if m.get("type") == "photo":
                 photos.append(m.get("media_url_https"))
                 
-        user = data.get("user", {})
-        text = data.get("text", "")
-        return {
-            "photos": photos,
-            "text": text,
-            "user_name": user.get("name", ""),
-            "screen_name": user.get("screen_name", "")
-        }
+        if photos:
+            user = data.get("user", {})
+            return {
+                "photos": photos,
+                "text": data.get("text", ""),
+                "user_name": user.get("name", ""),
+                "screen_name": user.get("screen_name", "")
+            }
     except Exception as e:
-        print(f"CDN fetch error: {e}")
-        return None
+        print(f"Syndication fetch error: {e}")
+
+    # Koshish 2: VxTwitter API
+    try:
+        vx_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
+        req = urllib.request.Request(vx_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            vx_data = json.loads(resp.read().decode('utf-8'))
+            media_list = vx_data.get("mediaURLs", [])
+            photos = [u for u in media_list if not u.endswith(('.mp4', '.m3u8'))]
+            if photos:
+                return {
+                    "photos": photos,
+                    "text": vx_data.get("text", ""),
+                    "user_name": vx_data.get("user_name", ""),
+                    "screen_name": vx_data.get("user_screen_name", "")
+                }
+    except Exception as e:
+        print(f"Vx API error: {e}")
+
+    return None
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
@@ -167,7 +212,7 @@ async def handle_twitter_url(client: Client, message: Message):
     status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
 
-    # Step 1: Pehle yt-dlp se video dhoondo
+    # Step 1: yt-dlp se video dhoondein
     def extract_video():
         opts = get_ydl_options()
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -179,26 +224,26 @@ async def handle_twitter_url(client: Client, message: Message):
         post_id = str(info.get("id") or tweet_id or message.id)
         direct_url = get_best_mp4_url(formats)
 
-        URL_CACHE[post_id] = {
-            "url": url,
-            "info": info,
-            "direct_url": direct_url
-        }
+        if formats and any(f.get("vcodec") != "none" for f in formats):
+            URL_CACHE[post_id] = {
+                "url": url,
+                "info": info,
+                "direct_url": direct_url
+            }
 
-        markup = build_quality_buttons(post_id, formats, direct_url)
-
-        if markup:
-            await status_msg.edit_text(
-                "🎬 **Video mil gayi!**\n\nQuality chunein ya browser download link use karein:",
-                reply_markup=markup
-            )
-            return
+            markup = build_quality_buttons(post_id, formats, direct_url)
+            if markup:
+                await status_msg.edit_text(
+                    "🎬 **Video mil gayi!**\n\nQuality chunein ya browser download link use karein:",
+                    reply_markup=markup
+                )
+                return
     except Exception:
         pass
 
-    # Step 2: Agar video nahi hai, toh Photo/Images extract karein
+    # Step 2: Agar video nahi hai, toh Photo/Images authenticated tareeqe se nikaalein
     if tweet_id:
-        img_data = await loop.run_in_executor(None, lambda: fetch_tweet_images_via_cdn(tweet_id))
+        img_data = await loop.run_in_executor(None, lambda: fetch_tweet_images_authenticated(tweet_id))
         if img_data and img_data["photos"]:
             photos = img_data["photos"]
             caption = f"{img_data['text'][:650]}\n\n𝕏 **{img_data['user_name']} (@{img_data['screen_name']})**\n🤖 @MyTwitterXDownloader_bot"
@@ -343,4 +388,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-    
+            
