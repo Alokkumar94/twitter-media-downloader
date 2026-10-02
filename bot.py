@@ -1,4 +1,5 @@
 import os
+import shutil
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -11,7 +12,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is active!")
+        self.wfile.write(b"Bot is alive!")
 
     def log_message(self, format, *args):
         return
@@ -37,17 +38,20 @@ app = Client(
 
 URL_CACHE = {}
 
-# Cookies path check
+# Cookies setup: Read-only error se bachne ke liye /tmp me copy karein
+SECRET_COOKIE_PATH = "/etc/secrets/cookies.txt"
+WRITABLE_COOKIE_PATH = "/tmp/cookies.txt"
 COOKIE_FILE = None
-for p in ["/etc/secrets/cookies.txt", os.path.join(os.getcwd(), "cookies.txt"), "cookies.txt"]:
-    if os.path.exists(p):
-        COOKIE_FILE = p
-        break
 
-if COOKIE_FILE:
-    print(f"✅ Loaded cookies successfully from: {COOKIE_FILE}")
-else:
-    print("⚠️ Cookies file nahi mili! 18+ posts block ho sakti hain.")
+if os.path.exists(SECRET_COOKIE_PATH):
+    try:
+        shutil.copyfile(SECRET_COOKIE_PATH, WRITABLE_COOKIE_PATH)
+        COOKIE_FILE = WRITABLE_COOKIE_PATH
+        print("✅ Secret cookies copied to /tmp/cookies.txt (Writable)")
+    except Exception as e:
+        print(f"⚠️ Cookie copy error: {e}")
+elif os.path.exists("cookies.txt"):
+    COOKIE_FILE = "cookies.txt"
 
 def get_ydl_options(extra_opts=None):
     opts = {
@@ -55,7 +59,7 @@ def get_ydl_options(extra_opts=None):
         'no_warnings': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     }
-    if COOKIE_FILE:
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
         opts['cookiefile'] = COOKIE_FILE
     if extra_opts:
         opts.update(extra_opts)
@@ -112,7 +116,7 @@ def build_quality_buttons(post_id, formats, direct_url=None):
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
-        "Mujhe kisi bhi Twitter/X post (Video ya Image) ka link bhejein!"
+        "Mujhe kisi bhi Twitter/X post ka link bhejein, main media download karke de dunga!"
     )
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
@@ -120,7 +124,7 @@ async def handle_twitter_url(client: Client, message: Message):
     url = message.text.strip()
     
     if not ("twitter.com" in url or "x.com" in url):
-        await message.reply_text("❌ Kripya valid Twitter/X link bhejein.")
+        await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
     status_msg = await message.reply_text("🔍 **Post fetch ki ja rahi hai...**")
@@ -155,7 +159,7 @@ async def handle_twitter_url(client: Client, message: Message):
                 reply_markup=markup
             )
         else:
-            # Agar tweet me video nahi balki photo/image hai
+            # Agar format na ho (image post ho)
             thumbnails = info.get("thumbnails", [])
             if thumbnails:
                 best_photo = thumbnails[-1].get("url")
@@ -169,7 +173,6 @@ async def handle_twitter_url(client: Client, message: Message):
     except Exception as e:
         err = str(e)
         if "No video could be found" in err:
-            # Fallback agar pure photo post ho
             try:
                 flat_opts = get_ydl_options({'extract_flat': True})
                 with yt_dlp.YoutubeDL(flat_opts) as ydl:
@@ -183,7 +186,7 @@ async def handle_twitter_url(client: Client, message: Message):
                         return
             except:
                 pass
-            await status_msg.edit_text("⚠️ **Notice:** Tweet load nahi hua. Post deleted ya private ho sakti hai.")
+            await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka.")
         else:
             await status_msg.edit_text(f"❌ Error: {err[:250]}")
 
@@ -318,4 +321,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-    
+            
