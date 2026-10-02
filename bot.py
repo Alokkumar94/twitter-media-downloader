@@ -2,6 +2,8 @@ import os
 import shutil
 import asyncio
 import threading
+import json
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -38,7 +40,6 @@ app = Client(
 
 URL_CACHE = {}
 
-# Cookies setup: Read-only error se bachne ke liye /tmp me copy karein
 SECRET_COOKIE_PATH = "/etc/secrets/cookies.txt"
 WRITABLE_COOKIE_PATH = "/tmp/cookies.txt"
 COOKIE_FILE = None
@@ -47,7 +48,7 @@ if os.path.exists(SECRET_COOKIE_PATH):
     try:
         shutil.copyfile(SECRET_COOKIE_PATH, WRITABLE_COOKIE_PATH)
         COOKIE_FILE = WRITABLE_COOKIE_PATH
-        print("✅ Secret cookies copied to /tmp/cookies.txt (Writable)")
+        print("✅ Secret cookies copied to /tmp/cookies.txt")
     except Exception as e:
         print(f"⚠️ Cookie copy error: {e}")
 elif os.path.exists("cookies.txt"):
@@ -112,11 +113,40 @@ def build_quality_buttons(post_id, formats, direct_url=None):
 
     return InlineKeyboardMarkup(buttons) if buttons else None
 
+async def download_twitter_images(client, chat_id, url, status_msg):
+    """Jab video na ho tab images fetch karne ke liye fallback"""
+    loop = asyncio.get_running_loop()
+    
+    def fetch_api():
+        # X / Twitter API URL converter for direct JSON metadata
+        api_url = url.replace("twitter.com", "api.vxtwitter.com").replace("x.com", "api.vxtwitter.com")
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode('utf-8'))
+
+    try:
+        data = await loop.run_in_executor(None, fetch_api)
+        media_urls = data.get("mediaURLs", [])
+        text = (data.get("text") or "")[:700]
+        user_name = data.get("user_name", "")
+        user_screen_name = data.get("user_screen_name", "")
+        
+        caption = f"{text}\n\n𝕏 **{user_name} (@{user_screen_name})**\n🤖 @MyTwitterXDownloader_bot"
+
+        if media_urls:
+            await client.send_photo(chat_id=chat_id, photo=media_urls[0], caption=caption)
+            await status_msg.delete()
+            return True
+    except Exception as e:
+        print(f"Image fallback error: {e}")
+    
+    return False
+
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     await message.reply_text(
         "👋 **Namaste! Main Twitter/X Media Downloader Bot hoon.**\n\n"
-        "Mujhe kisi bhi Twitter/X post ka link bhejein, main media download karke de dunga!"
+        "Mujhe kisi bhi Twitter/X post ka link bhejein, chahe video ho ya photo!"
     )
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
@@ -127,7 +157,7 @@ async def handle_twitter_url(client: Client, message: Message):
         await message.reply_text("❌ Kripya valid Twitter/X post ka link bhejein.")
         return
 
-    status_msg = await message.reply_text("🔍 **Post fetch ki ja rahi hai...**")
+    status_msg = await message.reply_text("🔍 **Post check ki ja rahi hai...**")
     loop = asyncio.get_running_loop()
 
     def extract():
@@ -138,8 +168,7 @@ async def handle_twitter_url(client: Client, message: Message):
     try:
         info = await loop.run_in_executor(None, extract)
         if not info:
-            await status_msg.edit_text("❌ Media data nahi mila.")
-            return
+            raise Exception("No video found")
 
         post_id = str(info.get("id") or message.id)
         formats = info.get("formats", [])
@@ -159,36 +188,14 @@ async def handle_twitter_url(client: Client, message: Message):
                 reply_markup=markup
             )
         else:
-            # Agar format na ho (image post ho)
-            thumbnails = info.get("thumbnails", [])
-            if thumbnails:
-                best_photo = thumbnails[-1].get("url")
-                caption = (info.get("description") or "")[:700] + "\n\n🤖 @MyTwitterXDownloader_bot"
-                await message.reply_photo(photo=best_photo, caption=caption)
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
-                await process_download(client, message.chat.id, post_id, "best", status_msg)
+            await status_msg.edit_text("⏳ **Download shuru ho raha hai...**")
+            await process_download(client, message.chat.id, post_id, "best", status_msg)
 
-    except Exception as e:
-        err = str(e)
-        if "No video could be found" in err:
-            try:
-                flat_opts = get_ydl_options({'extract_flat': True})
-                with yt_dlp.YoutubeDL(flat_opts) as ydl:
-                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
-                    thumbs = info.get("thumbnails") or []
-                    if thumbs:
-                        best_img = thumbs[-1].get("url")
-                        caption = (info.get("description") or "")[:700] + "\n\n🤖 @MyTwitterXDownloader_bot"
-                        await message.reply_photo(photo=best_img, caption=caption)
-                        await status_msg.delete()
-                        return
-            except:
-                pass
+    except Exception:
+        # Video nahi mili, ab direct photo check karein
+        success = await download_twitter_images(client, message.chat.id, url, status_msg)
+        if not success:
             await status_msg.edit_text("⚠️ **Notice:** Tweet media fetch nahi ho saka.")
-        else:
-            await status_msg.edit_text(f"❌ Error: {err[:250]}")
 
 @app.on_callback_query(filters.regex(r"^quality_menu\|"))
 async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
@@ -215,7 +222,7 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
         return
 
     await callback_query.answer("Downloading...")
-    status_msg = await callback_query.message.edit_text("⏳ **Download kiya ja raha hai...**")
+    status_msg = await callback_query.message.edit_text("⏳ **Download ho raha hai...**")
     
     await process_download(
         client, 
@@ -321,4 +328,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg):
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-            
+    
