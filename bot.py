@@ -178,7 +178,6 @@ async def cancel_task(client: Client, message: Message):
 async def handle_twitter_url(client: Client, message: Message):
     user_id = message.from_user.id
     
-    # Check if a task is already running for this user
     if user_id in ACTIVE_TASKS:
         await message.reply_text(
             "⚠️ **One Task Is Already Processing.**\n"
@@ -234,12 +233,17 @@ async def process_url(client: Client, message: Message, url: str, user_id: int):
                 ACTIVE_TASKS.pop(user_id, None)
                 return
 
-        # Agar video nahi hai -> Photos fetch karein
+        # Photos fetch karein
         if username and tweet_id:
             img_res = await loop.run_in_executor(None, lambda: fetch_photos_via_fxtwitter(username, tweet_id))
             if img_res and img_res["photos"]:
                 photos = img_res["photos"]
-                caption = f"{img_res['text'][:650]}\n\n𝕏 **{img_res['author_name']} (@{img_res['author_handle']})**\n🤖 @MyTwitterXDownloader_bot"
+                author_handle = img_res['author_handle']
+                caption = (
+                    f"{img_res['text'][:650]}\n\n"
+                    f"𝕏 {img_res['author_name']} [(@{author_handle})]({url})\n"
+                    f"🤖 @MyTwitterXDownloader_bot"
+                )
                 
                 if len(photos) == 1:
                     await client.send_photo(chat_id=message.chat.id, photo=photos[0], caption=caption)
@@ -265,7 +269,7 @@ async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
     _, post_id = callback_query.data.split("|")
     cached = URL_CACHE.get(post_id)
     if not cached:
-        await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
+        await callback_query.answer("⚠️️ Link expire ho gaya.", show_alert=True)
         return
 
     markup = build_quality_buttons(post_id, cached["info"].get("formats", []), cached.get("direct_url"))
@@ -280,7 +284,7 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
     if user_id in ACTIVE_TASKS:
-        await callback_query.answer("⚠️️ Pehle chal raha download complete hone dein!", show_alert=True)
+        await callback_query.answer("⚠️ Pehle chal raha download complete hone dein!", show_alert=True)
         return
 
     _, post_id, format_id = callback_query.data.split("|")
@@ -291,14 +295,16 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
         return
 
     await callback_query.answer("Downloading start ho raha hai...")
+    
+    menu_msg = callback_query.message
     status_msg = await callback_query.message.reply_text("⏳ **Download shuru ho raha hai...**")
     
     task = asyncio.create_task(
-        process_download(client, callback_query.message.chat.id, post_id, format_id, status_msg, user_id)
+        process_download(client, callback_query.message.chat.id, post_id, format_id, status_msg, user_id, menu_msg)
     )
     ACTIVE_TASKS[user_id] = {"task": task, "status_msg": status_msg}
 
-async def process_download(client, chat_id, post_id, format_id, status_msg, user_id):
+async def process_download(client, chat_id, post_id, format_id, status_msg, user_id, menu_msg=None):
     cached = URL_CACHE.get(post_id)
     url = cached["url"]
     direct_url = cached.get("direct_url")
@@ -336,7 +342,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
             if direct_url and ".m3u8" not in direct_url:
                 buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
             await status_msg.edit_text(
-                f"⚠️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
+                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
@@ -351,9 +357,10 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         if description:
             caption_parts.append(description[:700])
         
+        # Link ko username me embed kiya gaya hai
         if uploader:
-            handle = f" (@{uploader_id})" if uploader_id and uploader_id != uploader else ""
-            caption_parts.append(f"\n𝕏 **{uploader}{handle}**")
+            handle = f" [(@{uploader_id})]({url})" if uploader_id and uploader_id != uploader else f" [(@{uploader})]({url})"
+            caption_parts.append(f"\n𝕏 {uploader}{handle}")
             
         caption_parts.append("\n🤖 @MyTwitterXDownloader_bot")
         final_caption = "\n".join(caption_parts)
@@ -373,7 +380,15 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         else:
             await client.send_document(chat_id=chat_id, document=filename, caption=final_caption, reply_markup=reply_markup)
 
+        # Status message delete karein
         await status_msg.delete()
+
+        # Quality selection message delete karein
+        if menu_msg:
+            try:
+                await menu_msg.delete()
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         await status_msg.edit_text("❌ Download cancel kar diya gaya.")
