@@ -242,7 +242,7 @@ async def process_url(client: Client, message: Message, url: str, user_id: int):
                 caption = (
                     f"{img_res['text'][:650]}\n\n"
                     f"𝕏 {img_res['author_name']} [(@{author_handle})]({url})\n"
-                    f"🤖 @MyTwitterXDownloader_bot"
+                    f"🤖 @MyTwitterX_DL_bot"
                 )
                 
                 if len(photos) == 1:
