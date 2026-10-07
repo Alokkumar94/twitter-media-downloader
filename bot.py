@@ -362,7 +362,7 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
             handle = f" [(@{uploader_id})]({url})" if uploader_id and uploader_id != uploader else f" [(@{uploader})]({url})"
             caption_parts.append(f"\n𝕏 {uploader}{handle}")
             
-        caption_parts.append("\n🤖 @MyTwitterXDownloader_bot")
+        caption_parts.append("\n🤖 @MyTwitterX_DL_bot")
         final_caption = "\n".join(caption_parts)
 
         btn_rows = [
