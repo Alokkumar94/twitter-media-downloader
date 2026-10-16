@@ -10,7 +10,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 import yt_dlp
 
-# --- Render Dummy Web Server ---
+# --- Render / Back4app Dummy Web Server ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -41,6 +41,9 @@ app = Client(
 
 URL_CACHE = {}
 ACTIVE_TASKS = {}  # {user_id: {"task": asyncio.Task, "status_msg": Message}}
+
+# Limit set to 100 MB
+MAX_UPLOAD_MB = 100
 
 SECRET_COOKIE_PATH = "/etc/secrets/cookies.txt"
 WRITABLE_COOKIE_PATH = "/tmp/cookies.txt"
@@ -269,7 +272,7 @@ async def quality_menu_handler(client: Client, callback_query: CallbackQuery):
     _, post_id = callback_query.data.split("|")
     cached = URL_CACHE.get(post_id)
     if not cached:
-        await callback_query.answer("⚠️️ Link expire ho gaya.", show_alert=True)
+        await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
         return
 
     markup = build_quality_buttons(post_id, cached["info"].get("formats", []), cached.get("direct_url"))
@@ -294,10 +297,10 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("⚠️ Link expire ho gaya.", show_alert=True)
         return
 
-    await callback_query.answer("Downloading start ho raha hai...")
+    await callback_query.answer("Processing start ho rahi hai...")
     
     menu_msg = callback_query.message
-    status_msg = await callback_query.message.reply_text("⏳ **Download shuru ho raha hai...**")
+    status_msg = await callback_query.message.reply_text("⏳ **Check kiya ja raha hai...**")
     
     task = asyncio.create_task(
         process_download(client, callback_query.message.chat.id, post_id, format_id, status_msg, user_id, menu_msg)
@@ -307,12 +310,57 @@ async def callback_download(client: Client, callback_query: CallbackQuery):
 async def process_download(client, chat_id, post_id, format_id, status_msg, user_id, menu_msg=None):
     cached = URL_CACHE.get(post_id)
     url = cached["url"]
-    direct_url = cached.get("direct_url")
+    info = cached.get("info", {})
+    formats = info.get("formats", [])
+    default_direct_url = cached.get("direct_url")
     loop = asyncio.get_running_loop()
     
     out_dir = f"downloads/{post_id}_{user_id}"
     os.makedirs(out_dir, exist_ok=True)
-    
+
+    # 1. Target format aur specific direct URL nikaalein
+    selected_format = None
+    target_direct_url = default_direct_url
+
+    if format_id != 'best':
+        for f in formats:
+            if str(f.get("format_id")) == str(format_id):
+                selected_format = f
+                if f.get("url") and ".m3u8" not in f.get("url", ""):
+                    target_direct_url = f.get("url")
+                break
+    else:
+        # Best quality
+        mp4_formats = [f for f in formats if f.get("ext") == "mp4" or f.get("vcodec") != "none"]
+        if mp4_formats:
+            mp4_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
+            selected_format = mp4_formats[0]
+            if selected_format.get("url") and ".m3u8" not in selected_format.get("url", ""):
+                target_direct_url = selected_format.get("url")
+
+    # 2. PRE-CHECK: Download karne se pehle hi check karo (Zero Server Space Used)
+    if selected_format:
+        est_size = selected_format.get("filesize") or selected_format.get("filesize_approx") or 0
+        est_mb = est_size / (1024 * 1024) if est_size else 0
+
+        # Agar format 100MB se bada hai, ya format height >= 1080p hai aur size unknown/bada hai
+        height = selected_format.get("height") or 0
+        if (est_mb > MAX_UPLOAD_MB) or (height >= 1080 and (est_mb > MAX_UPLOAD_MB or est_mb == 0)):
+            display_size = f"{est_mb:.1f} MB" if est_mb > 0 else f"{height}p High Quality"
+            buttons = []
+            if target_direct_url and ".m3u8" not in target_direct_url:
+                buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=target_direct_url)])
+            
+            await status_msg.edit_text(
+                f"⚠️ **File Size Bada Hai ({display_size})**\n\n"
+                f"Container limit (100 MB) se badi files server par load nahi hoti.\n"
+                f"Kripya direct high-speed browser se download karein:",
+                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+            )
+            shutil.rmtree(out_dir, ignore_errors=True)
+            ACTIVE_TASKS.pop(user_id, None)
+            return
+
     ydl_opts = get_ydl_options({
         'format': f'{format_id}+bestaudio/best' if format_id != 'best' else 'best',
         'outtmpl': f'{out_dir}/%(id)s.%(ext)s',
@@ -336,13 +384,16 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         file_size_bytes = os.path.getsize(filename) if os.path.exists(filename) else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
 
-        if file_size_mb > 400:
-            os.remove(filename)
+        # 3. POST-CHECK: Agar download ke baad size 100 MB se bada nikle
+        if file_size_mb > MAX_UPLOAD_MB:
+            if os.path.exists(filename):
+                os.remove(filename)
             buttons = []
-            if direct_url and ".m3u8" not in direct_url:
-                buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=direct_url)])
+            if target_direct_url and ".m3u8" not in target_direct_url:
+                buttons.append([InlineKeyboardButton("🚀 Direct MP4 Download (Browser)", url=target_direct_url)])
             await status_msg.edit_text(
-                f"⚠️️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\nDirect browser se download karein:",
+                f"⚠️ **File Size Bada Hai ({file_size_mb:.1f} MB)**\n\n"
+                f"100 MB se badi file hai. Direct browser se download karein:",
                 reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
             )
             return
@@ -357,7 +408,6 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         if description:
             caption_parts.append(description[:700])
         
-        # Link ko username me embed kiya gaya hai
         if uploader:
             handle = f" [(@{uploader_id})]({url})" if uploader_id and uploader_id != uploader else f" [(@{uploader})]({url})"
             caption_parts.append(f"\n𝕏 {uploader}{handle}")
@@ -368,8 +418,8 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         btn_rows = [
             [InlineKeyboardButton("Download with different quality 📥", callback_data=f"quality_menu|{post_id}")]
         ]
-        if direct_url and ".m3u8" not in direct_url:
-            btn_rows.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=direct_url)])
+        if target_direct_url and ".m3u8" not in target_direct_url:
+            btn_rows.append([InlineKeyboardButton("🚀 Direct Fast Download Link", url=target_direct_url)])
             
         reply_markup = InlineKeyboardMarkup(btn_rows)
 
@@ -380,10 +430,8 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
         else:
             await client.send_document(chat_id=chat_id, document=filename, caption=final_caption, reply_markup=reply_markup)
 
-        # Status message delete karein
         await status_msg.delete()
 
-        # Quality selection message delete karein
         if menu_msg:
             try:
                 await menu_msg.delete()
@@ -402,4 +450,4 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
 if __name__ == "__main__":
     print("Bot start ho raha hai...")
     app.run()
-    
+                                   
