@@ -447,7 +447,17 @@ async def process_download(client, chat_id, post_id, format_id, status_msg, user
             shutil.rmtree(out_dir, ignore_errors=True)
         ACTIVE_TASKS.pop(user_id, None)
 
+import time
+from pyrogram.errors import RPCError
+
 if __name__ == "__main__":
-    print("Bot start ho raha hai...")
-    app.run()
+    while True:
+        try:
+            print("Bot start ho raha hai...", flush=True)
+            app.run()
+            break
+        except RPCError as e:
+            print(f"⚠️ Telegram Server Error ({e}), 10 second me retry kar raha hu...", flush=True)
+            time.sleep(10)
+            
                                    
