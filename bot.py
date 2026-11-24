@@ -483,17 +483,33 @@ async def process_download(bot, chat_id, post_id, format_id, status_msg, user_id
         ACTIVE_TASKS.pop(user_id, None)
 
 
+import time
+
 def main():
-    print("Bot start ho raha hai (HTTP Bot API Mode)...", flush=True)
-    application = Application.builder().token(BOT_TOKEN).build()
+    while True:
+        try:
+            print("Bot start ho raha hai (HTTP Bot API Mode)...", flush=True)
+            application = (
+                Application.builder()
+                .token(BOT_TOKEN)
+                .connect_timeout(30.0)
+                .read_timeout(30.0)
+                .write_timeout(30.0)
+                .pool_timeout(30.0)
+                .build()
+            )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("cancel", cancel_task))
-    application.add_handler(CallbackQueryHandler(quality_menu_handler, pattern=r"^quality_menu\|"))
-    application.add_handler(CallbackQueryHandler(callback_download, pattern=r"^dl\|"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_twitter_url))
+            application.add_handler(CommandHandler("start", start_command))
+            application.add_handler(CommandHandler("cancel", cancel_task))
+            application.add_handler(CallbackQueryHandler(quality_menu_handler, pattern=r"^quality_menu\|"))
+            application.add_handler(CallbackQueryHandler(callback_download, pattern=r"^dl\|"))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_twitter_url))
 
-    application.run_polling(drop_pending_updates=True)
+            application.run_polling(drop_pending_updates=True)
+            break
+        except Exception as e:
+            print(f"⚠️ Connection/Telegram Error: {e} — 5 second me retry kar raha hu...", flush=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
