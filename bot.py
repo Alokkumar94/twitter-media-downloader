@@ -487,6 +487,8 @@ import time
 
 def main():
     while True:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
             print("Bot start ho raha hai (HTTP Bot API Mode)...", flush=True)
             application = (
@@ -505,11 +507,16 @@ def main():
             application.add_handler(CallbackQueryHandler(callback_download, pattern=r"^dl\|"))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_twitter_url))
 
-            application.run_polling(drop_pending_updates=True)
+            application.run_polling(drop_pending_updates=True, close_loop=False)
             break
         except Exception as e:
             print(f"⚠️ Connection/Telegram Error: {e} — 5 second me retry kar raha hu...", flush=True)
             time.sleep(5)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
