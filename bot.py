@@ -484,6 +484,7 @@ async def process_download(bot, chat_id, post_id, format_id, status_msg, user_id
 
 
 import time
+from telegram.error import RetryAfter
 
 def main():
     while True:
@@ -507,11 +508,15 @@ def main():
             application.add_handler(CallbackQueryHandler(callback_download, pattern=r"^dl\|"))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_twitter_url))
 
-            application.run_polling(drop_pending_updates=True, close_loop=False)
+            application.run_polling(drop_pending_updates=False, close_loop=False)
             break
+        except RetryAfter as e:
+            wait_sec = int(e.retry_after) + 2
+            print(f"⏳ Flood control: {wait_sec} second ruk kar retry kar raha hu...", flush=True)
+            time.sleep(wait_sec)
         except Exception as e:
-            print(f"⚠️ Connection/Telegram Error: {e} — 5 second me retry kar raha hu...", flush=True)
-            time.sleep(5)
+            print(f"⚠️ Connection/Telegram Error: {e} — 15 second me retry kar raha hu...", flush=True)
+            time.sleep(15)
         finally:
             try:
                 loop.close()
